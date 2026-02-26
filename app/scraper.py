@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import html2text
 
 def download_problem(url):
+	print(url)
 	soup = BeautifulSoup(requests.get(url).text, 'html.parser')
 
 	# 初始化转换器
