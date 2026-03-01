@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         QOJ 题目翻译 (防幻觉)
+// @name         QOJ 题目翻译 (支持 OCR API)
 // @namespace    http://tampermonkey.net/
 // @version      1.5
 // @description  自动解析 QOJ PDF 题目，调用 DeepSeek API 翻译。支持纯文本提取与 Tesseract.js OCR 识别。新增防幻觉 Prompt，避免纯图片 PDF 翻译出虚假题目。
@@ -34,7 +34,7 @@
 
 如果文本正常，你需要做的事：
 1. 忽略文字中其他部分（如输入输出及其格式，以及样例），只提取题目的题目描述部分。如果题目原文有样例解释，你应该同时翻译解释部分，否则不应该主动解释样例。
-2. **极力修复错乱的数学变量和公式**，结合上下文语境，重新使用标准的 LaTeX 语法（用 $ 符号包裹）表示。
+2. 修复错乱的数学变量和公式，结合上下文语境，重新使用标准的 LaTeX 语法**（使用美元符号包裹）**表示。
 3. 将题目准确地翻译成中文，不要改写题目内容，不要解决或者分析问题，只给出题目的翻译，不要输出其他任何内容。
 
 【重要判定规则】
@@ -305,46 +305,104 @@
         return fullText;
     }
 
-    // 模式 2：OCR 提取 (PDF -> Canvas -> Tesseract.js)
-    async function extractTextWithOCR(url, fetchSignal) {
-        statusEl.textContent = '正在初始化 OCR 引擎 (首次需下载语言模型，请耐心等待)...';
+    // ==========================================
+    // 新增：视觉大模型 (Vision API) 配置
+    // ==========================================
+    let visionApiKey = GM_getValue('vision_api_key', '');
+    let visionApiUrl = GM_getValue('vision_api_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'); // 默认使用阿里云通义千问
+    let visionModel = GM_getValue('vision_model', 'qwen-vl-max'); // 默认模型
 
-        // 初始化 Tesseract worker，支持中英文
-        const worker = await Tesseract.createWorker('eng+chi_sim');
-
-        try {
-            statusEl.textContent = '正在抓取 PDF 原始数据...';
-            const response = await fetch(url, { signal: fetchSignal });
-            const arrayBuffer = await response.arrayBuffer();
-            const loadingTask = window.pdfjsLib.getDocument({ data: arrayBuffer });
-            const pdf = await loadingTask.promise;
-
-            let fullText = '';
-            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-                if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-                statusEl.textContent = `正在渲染并进行 OCR 识别 (第 ${pageNum}/${pdf.numPages} 页，可能较慢)...`;
-                const page = await pdf.getPage(pageNum);
-
-                // 放大 2 倍渲染以提高 OCR 识别率
-                const viewport = page.getViewport({ scale: 2.0 });
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                canvas.height = viewport.height;
-                canvas.width = viewport.width;
-
-                await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-
-                if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
-
-                // 将 Canvas 交给 Tesseract 识别
-                const ret = await worker.recognize(canvas);
-                fullText += ret.data.text + '\n\n';
-            }
-            return fullText;
-        } finally {
-            await worker.terminate(); // 释放内存
+    GM_registerMenuCommand('🖼️ 设置 Vision API (用于高精度公式 OCR)', () => {
+        const newKey = prompt('请输入用于 OCR 的视觉大模型 API Key (如 Qwen-VL 或 GPT-4o):', visionApiKey);
+        if (newKey !== null) {
+            GM_setValue('vision_api_key', newKey.trim());
+            const newUrl = prompt('请输入 Vision API 的 Base URL:', visionApiUrl);
+            if (newUrl) GM_setValue('vision_api_url', newUrl.trim());
+            const newModel = prompt('请输入 Vision 模型名称:', visionModel);
+            if (newModel) GM_setValue('vision_model', newModel.trim());
+            alert('Vision API 配置已保存！');
         }
+    });
+
+    // ==========================================
+    // 升级版：使用视觉大模型进行高精度数学 OCR
+    // ==========================================
+    async function extractTextWithOCR(url, fetchSignal) {
+        if (!visionApiKey) {
+            throw new Error("未配置 Vision API Key！请点击油猴菜单中的【🖼️ 设置 Vision API】进行配置。");
+        }
+
+        statusEl.textContent = '正在抓取 PDF 原始数据...';
+        const response = await fetch(url, { signal: fetchSignal });
+        const arrayBuffer = await response.arrayBuffer();
+        const loadingTask = window.pdfjsLib.getDocument({ data: arrayBuffer });
+        const pdf = await loadingTask.promise;
+
+        let fullText = '';
+
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+            if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+            statusEl.textContent = `正在使用视觉大模型识别公式与文本 (第 ${pageNum}/${pdf.numPages} 页)...`;
+            const page = await pdf.getPage(pageNum);
+
+            // 渲染为 Canvas (放大 2 倍保证清晰度)
+            const viewport = page.getViewport({ scale: 2.0 });
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+            // 将 Canvas 转换为 Base64 JPEG 图片
+            const base64Image = canvas.toDataURL('image/jpeg', 0.8);
+
+            // 构造发给视觉大模型的请求
+            const visionPrompt = `你是一个专业的数学与算法竞赛文档解析器。
+请提取这张图片中的所有文本和数学公式。
+要求：
+1. 保持原有的段落排版。
+2. 所有的数学公式、变量、上下标必须使用标准的 LaTeX 语法表示。
+3. 行内公式使用 $ 包裹，独立公式使用 $$ 包裹。
+4. 不要解释，不要翻译，只输出提取出的 Markdown 纯文本。`;
+
+            const payload = {
+                model: visionModel,
+                messages: [
+                    {
+                        role: "user",
+                        content:[
+                            { type: "text", text: visionPrompt },
+                            { type: "image_url", image_url: { url: base64Image } }
+                        ]
+                    }
+                ],
+                max_tokens: 2000
+            };
+
+            // 调用 Vision API
+            const visionRes = await fetch(visionApiUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${visionApiKey}`
+                },
+                body: JSON.stringify(payload),
+                signal: fetchSignal
+            });
+
+            if (!visionRes.ok) {
+                const errData = await visionRes.text();
+                throw new Error(`Vision API 识别失败: ${visionRes.status} - ${errData}`);
+            }
+
+            const visionData = await visionRes.json();
+            const extractedText = visionData.choices[0].message.content;
+
+            fullText += extractedText + '\n\n';
+        }
+
+        return fullText;
     }
 
     // ==========================================
