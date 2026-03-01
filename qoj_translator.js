@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         QOJ 题目翻译 (可定制 Prompt + DeepSeek 版 + 双主题 + 缓存 + 重新翻译)
+// @name         QOJ 题目翻译 (防幻觉)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  自动解析 QOJ PDF 题目，调用 DeepSeek API 翻译。支持用户自定义 Prompt，支持 Light/Dark 模式切换。新增翻译缓存与手动重新翻译按钮。
-// @author       banana, gemini
+// @version      1.5
+// @description  自动解析 QOJ PDF 题目，调用 DeepSeek API 翻译。支持纯文本提取与 Tesseract.js OCR 识别。新增防幻觉 Prompt，避免纯图片 PDF 翻译出虚假题目。
+// @author       banana, gemini, assistant
+// @match        https://contest.ucup.ac/contest/*/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
 // @match        https://qoj.ac/problem/*
 // @grant        GM_addStyle
@@ -16,6 +17,7 @@
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js
 // @require      https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/texmath.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
+// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js
 // @resource     katexCSS https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css
 // @resource     texmathCSS https://cdn.jsdelivr.net/npm/markdown-it-texmath@1.0.0/css/texmath.min.css
 // ==/UserScript==
@@ -27,11 +29,17 @@
     // 1. 配置管理 (API Key, Prompt & Theme)
     // ==========================================
 
-    const DEFAULT_PROMPT = `以下内容是我从算法竞赛题目的 PDF 文件中提取出的纯文本。由于提取限制，**一些数学公式、上下标、空格和换行可能会错乱**。
-你需要做的事：
+    // v1.5 新增：防御性 Prompt，防止 AI 在遇到乱码/空文本时产生幻觉编造题目
+    const DEFAULT_PROMPT = `以下内容是我从算法竞赛题目的 PDF 文件中提取出的纯文本（可能是通过 OCR 识别的）。由于提取限制，**一些数学公式、上下标、空格和换行可能会严重错乱**。
+
+如果文本正常，你需要做的事：
 1. 忽略文字中其他部分（如输入输出及其格式，以及样例），只提取题目的题目描述部分。如果题目原文有样例解释，你应该同时翻译解释部分，否则不应该主动解释样例。
-2. **修复错乱的数学变量和公式**，重新使用标准的 LaTeX 语法（用 $ 符号包裹）表示。
-3. 将题目准确地翻译成中文，不要改写题目内容，不要解决或者分析问题，只给出题目的翻译，不要输出其他任何内容。`;
+2. **极力修复错乱的数学变量和公式**，结合上下文语境，重新使用标准的 LaTeX 语法（用 $ 符号包裹）表示。
+3. 将题目准确地翻译成中文，不要改写题目内容，不要解决或者分析问题，只给出题目的翻译，不要输出其他任何内容。
+
+【重要判定规则】
+如果下方提供的待翻译文本几乎为空，或者全是无意义的乱码、无法构成连贯的英文/中文句子，**请绝对不要自行编造或猜测题目内容**！你必须直接输出以下警告信息，并且不要输出任何其他内容：
+"> ⚠️ **文本提取失败或内容无法识别。** 这可能是一个纯图片或扫描版的 PDF。请点击上方的【📷 OCR 强制翻译】按钮进行重试。"`;
 
     let apiKey = GM_getValue('deepseek_api_key', '');
     let customPrompt = GM_getValue('deepseek_custom_prompt', DEFAULT_PROMPT);
@@ -95,6 +103,8 @@
             --btn-border: #555;
             --btn-text: #e5e5e5;
             --btn-disabled: #2f2f2f;
+            --btn-ocr-bg: #4a3f2b;
+            --btn-ocr-hover: #5c4e36;
         }
         /* 明亮模式变量 */
         .ai-translation-box.theme-light {
@@ -112,6 +122,8 @@
             --btn-border: #d1d5da;
             --btn-text: #24292e;
             --btn-disabled: #f0f2f4;
+            --btn-ocr-bg: #fff8e7;
+            --btn-ocr-hover: #fdf0d5;
         }
 
         /* 翻译框基础样式 */
@@ -142,12 +154,22 @@
             border: 1px solid var(--pre-border);
             overflow-x: auto;
         }
+        .ai-translation-box blockquote {
+            border-left: 4px solid #d4a72c;
+            padding-left: 10px;
+            color: #d4a72c;
+            margin-left: 0;
+            background: rgba(212, 167, 44, 0.1);
+            padding: 10px;
+            border-radius: 0 4px 4px 0;
+        }
 
         .ai-toolbar {
             display: flex;
             align-items: center;
             gap: 12px;
             margin-bottom: 10px;
+            flex-wrap: wrap;
         }
         .ai-status-msg {
             font-style: italic;
@@ -174,6 +196,11 @@
             opacity: 0.75;
             background: var(--btn-disabled);
         }
+        .ai-ocr-btn {
+            background: var(--btn-ocr-bg);
+            border-color: #d4a72c;
+        }
+        .ai-ocr-btn:hover { background: var(--btn-ocr-hover); }
 
         .ai-error { color: #ff6b6b; }
     `);
@@ -183,12 +210,13 @@
     const iframe = document.querySelector('iframe#statements-pdf');
     if (!iframe) return;
 
-    // 结构化容器：toolbar + content，避免渲染时把按钮刷掉
+    // 结构化容器：toolbar + content
     const container = document.createElement('div');
     container.className = `ai-translation-box theme-${currentTheme}`;
     container.innerHTML = `
         <div class="ai-toolbar">
             <button type="button" class="ai-btn ai-retranslate">🔄 重新翻译</button>
+            <button type="button" class="ai-btn ai-ocr-btn" title="当 PDF 是纯图片或扫描件时使用此功能">📷 OCR 强制翻译</button>
             <div class="ai-status-msg">正在准备 PDF 解析引擎...</div>
         </div>
         <div class="ai-content"></div>
@@ -198,16 +226,17 @@
     const statusEl = container.querySelector('.ai-status-msg');
     const contentEl = container.querySelector('.ai-content');
     const retranslateBtn = container.querySelector('.ai-retranslate');
+    const ocrBtn = container.querySelector('.ai-ocr-btn');
 
     // ==========================================
-    // 2.5 缓存工具 (新增)
+    // 2.5 缓存工具
     // ==========================================
-    const CACHE_PREFIX = 'deepseek_translation_cache_v1';
+    const CACHE_PREFIX = 'deepseek_translation_cache_v2';
 
     function djb2Hash(str) {
         let h = 5381;
         for (let i = 0; i < str.length; i++) {
-            h = ((h << 5) + h) + str.charCodeAt(i); // h*33 + c
+            h = ((h << 5) + h) + str.charCodeAt(i);
             h >>>= 0;
         }
         return h.toString(16);
@@ -216,16 +245,16 @@
     function normalizeUrlForCache(u) {
         try {
             const url = new URL(u, location.href);
-            return `${url.origin}${url.pathname}`; // 去掉 query/hash，提升命中稳定性
+            return `${url.origin}${url.pathname}`;
         } catch {
             return String(u || '');
         }
     }
 
-    function buildCacheKey() {
+    function buildCacheKey(useOCR) {
         const pageId = `${location.origin}${location.pathname}`;
         const pdfId = normalizeUrlForCache(iframe.src);
-        const raw = `${pageId}|${pdfId}|${customPrompt}`;
+        const raw = `${pageId}|${pdfId}|${customPrompt}|ocr:${useOCR}`;
         return `${CACHE_PREFIX}:${djb2Hash(raw)}`;
     }
 
@@ -247,10 +276,11 @@
     }
 
     // ==========================================
-    // 3. PDF 解析核心
+    // 3. PDF 解析核心 (纯文本提取 + OCR 提取)
     // ==========================================
     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
+    // 模式 1：常规纯文本提取
     async function extractTextFromPDF(url, fetchSignal) {
         statusEl.textContent = '正在抓取 PDF 原始数据...';
         const response = await fetch(url, { signal: fetchSignal });
@@ -260,6 +290,7 @@
 
         let fullText = '';
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+            if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
             statusEl.textContent = `正在解析 PDF 文本 (第 ${pageNum}/${pdf.numPages} 页)...`;
             const page = await pdf.getPage(pageNum);
             const textContent = await page.getTextContent();
@@ -274,21 +305,63 @@
         return fullText;
     }
 
+    // 模式 2：OCR 提取 (PDF -> Canvas -> Tesseract.js)
+    async function extractTextWithOCR(url, fetchSignal) {
+        statusEl.textContent = '正在初始化 OCR 引擎 (首次需下载语言模型，请耐心等待)...';
+
+        // 初始化 Tesseract worker，支持中英文
+        const worker = await Tesseract.createWorker('eng+chi_sim');
+
+        try {
+            statusEl.textContent = '正在抓取 PDF 原始数据...';
+            const response = await fetch(url, { signal: fetchSignal });
+            const arrayBuffer = await response.arrayBuffer();
+            const loadingTask = window.pdfjsLib.getDocument({ data: arrayBuffer });
+            const pdf = await loadingTask.promise;
+
+            let fullText = '';
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+                statusEl.textContent = `正在渲染并进行 OCR 识别 (第 ${pageNum}/${pdf.numPages} 页，可能较慢)...`;
+                const page = await pdf.getPage(pageNum);
+
+                // 放大 2 倍渲染以提高 OCR 识别率
+                const viewport = page.getViewport({ scale: 2.0 });
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+                if (fetchSignal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+                // 将 Canvas 交给 Tesseract 识别
+                const ret = await worker.recognize(canvas);
+                fullText += ret.data.text + '\n\n';
+            }
+            return fullText;
+        } finally {
+            await worker.terminate(); // 释放内存
+        }
+    }
+
     // ==========================================
-    // 4. 发送翻译请求 + 缓存逻辑 (新增)
+    // 4. 发送翻译请求 + 缓存逻辑
     // ==========================================
     let translating = false;
     let currentAbortController = null;
 
-    async function startTranslation({ force = false } = {}) {
-        const cacheKey = buildCacheKey();
+    async function startTranslation({ force = false, useOCR = false } = {}) {
+        const cacheKey = buildCacheKey(useOCR);
 
         // 1) 非强制模式：优先读缓存
         if (!force) {
             const cached = loadCache(cacheKey);
             if (cached) {
                 const dt = new Date(cached.savedAt);
-                statusEl.textContent = `✅ 已从缓存加载（${dt.toLocaleString()}）`;
+                statusEl.textContent = `✅ 已从缓存加载（${dt.toLocaleString()}）${useOCR ? '[OCR模式]' : ''}`;
                 contentEl.innerHTML = md.render(cached.mdContent);
                 return;
             }
@@ -301,15 +374,32 @@
 
         translating = true;
         retranslateBtn.disabled = true;
+        ocrBtn.disabled = true;
         contentEl.innerHTML = '';
-        statusEl.textContent = force ? '🔄 正在强制重新翻译（将覆盖缓存）...' : '正在准备翻译...';
+
+        if (useOCR) {
+            statusEl.textContent = '📷 正在启动 OCR 强制翻译流程...';
+        } else {
+            statusEl.textContent = force ? '🔄 正在强制重新翻译（将覆盖缓存）...' : '正在准备翻译...';
+        }
 
         const abortController = new AbortController();
         currentAbortController = abortController;
 
         try {
-            const pdfText = await extractTextFromPDF(iframe.src, abortController.signal);
-            if (!pdfText.trim()) throw new Error("PDF 文本提取失败");
+            // 根据是否启用 OCR 选择提取方式
+            const pdfText = useOCR
+                ? await extractTextWithOCR(iframe.src, abortController.signal)
+                : await extractTextFromPDF(iframe.src, abortController.signal);
+
+            // 基础拦截：如果连一个字符都没有，直接报错
+            if (!pdfText.trim()) {
+                if (!useOCR) {
+                    throw new Error("常规文本提取失败或为空。如果这是扫描版 PDF，请点击【📷 OCR 强制翻译】按钮。");
+                } else {
+                    throw new Error("OCR 识别未提取到任何文本。");
+                }
+            }
 
             const finalPrompt = `${customPrompt}\n\n--- 待翻译文本如下 ---\n${pdfText}`;
 
@@ -321,7 +411,7 @@
                 },
                 body: JSON.stringify({
                     model: 'deepseek-chat',
-                    messages: [{ role: 'user', content: finalPrompt }],
+                    messages:[{ role: 'user', content: finalPrompt }],
                     stream: true
                 }),
                 signal: abortController.signal
@@ -371,25 +461,27 @@
 
             // 3) 完成后写缓存
             saveCache(cacheKey, mdContent);
-            statusEl.textContent = '✅ 翻译完成（已缓存，可点击“重新翻译”覆盖）';
+            statusEl.textContent = `✅ 翻译完成（已缓存，可点击“重新翻译”覆盖）${useOCR ? '[OCR模式]' : ''}`;
 
         } catch (err) {
             if (err?.name === 'AbortError') {
                 statusEl.textContent = '已中断当前翻译任务。';
             } else {
-                statusEl.innerHTML = `<span class="ai-error">错误: ${err.message}</span>（请检查 API Key 或网络连通性）`;
+                statusEl.innerHTML = `<span class="ai-error">错误: ${err.message}</span>`;
             }
         } finally {
             translating = false;
             retranslateBtn.disabled = false;
+            ocrBtn.disabled = false;
             currentAbortController = null;
         }
     }
 
-    // 按钮：强制重新翻译（绕过缓存并覆盖）
-    retranslateBtn.addEventListener('click', () => startTranslation({ force: true }));
+    // 按钮事件绑定
+    retranslateBtn.addEventListener('click', () => startTranslation({ force: true, useOCR: false }));
+    ocrBtn.addEventListener('click', () => startTranslation({ force: true, useOCR: true }));
 
-    // 自动启动：优先缓存，否则翻译
-    startTranslation({ force: false });
+    // 自动启动：优先缓存，否则常规翻译
+    startTranslation({ force: false, useOCR: false });
 
 })();
