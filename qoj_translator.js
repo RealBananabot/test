@@ -310,7 +310,7 @@
     // ==========================================
     let visionApiKey = GM_getValue('vision_api_key', '');
     let visionApiUrl = GM_getValue('vision_api_url', 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'); // 默认使用阿里云通义千问
-    let visionModel = GM_getValue('vision_model', 'qwen-vl-max'); // 默认模型
+    let visionModel = GM_getValue('vision_model', 'qwen-vl-ocr'); // 默认模型
 
     GM_registerMenuCommand('🖼️ 设置 Vision API (用于高精度公式 OCR)', () => {
         const newKey = prompt('请输入用于 OCR 的视觉大模型 API Key (如 Qwen-VL 或 GPT-4o):', visionApiKey);
