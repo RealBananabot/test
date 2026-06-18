@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         AtCoder 题目与题解翻译 (支持 DeepSeek & OpenRouter)
+// @name         AtCoder 题目与题解翻译
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      4.0
 // @description  支持 Markdown 和数学公式渲染，支持 DeepSeek 直连及 OpenAI 兼容接口(如 OpenRouter)，支持题解翻译与思维链展示。
 // @author       banana (modified)
 // @match        https://atcoder.jp/contests/*/tasks/*
@@ -67,14 +67,25 @@
         .ai-translate-btn { display: inline-block; padding: 10px 28px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
         .ai-translate-btn:hover { background: #0056b3; }
         .ai-translate-btn:disabled { background: #999; cursor: not-allowed; }
-        .ai-retranslate-bar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+        .ai-retranslate-bar { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-bottom: 12px; }
         .ai-retranslate-btn { padding: 4px 14px; font-size: 13px; background: #f0f0f0; color: #555; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; }
         .ai-retranslate-btn:hover { background: #e0e0e0; }
+        .ai-copy-btn { padding: 4px 14px; font-size: 13px; background: #f0f0f0; color: #555; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; }
+        .ai-copy-btn:hover { background: #e0e0e0; }
+        .ai-copy-btn.copied { background: #d4edda; color: #155724; border-color: #28a745; }
 
         /* KaTeX 公式渲染修复 */
         .ai-translation-box .katex-display { margin: 0.5em 0 !important; }
         .ai-translation-box .katex { font-size: 1.05em !important; color: #000 !important; }
         .ai-translation-box p { margin-bottom: 10px; word-break: break-word; }
+
+        /* 列表样式 */
+        .ai-translation-box ul, .ai-translation-box ol { padding-left: 2em; margin: 0.5em 0; }
+        .ai-translation-box li { margin-bottom: 0.25em; }
+        .ai-translation-box ul { list-style-type: disc; }
+        .ai-translation-box ul ul { list-style-type: circle; }
+        .ai-translation-box ul ul ul { list-style-type: square; }
+        .ai-translation-box ol { list-style-type: decimal; }
     `);
 
     // 创建设置面板 DOM
@@ -259,10 +270,11 @@
         }
     }
 
-    function saveCache(html, reasoning) {
+    function saveCache(html, reasoning, rawMd) {
         GM_setValue(CACHE_KEY, JSON.stringify({
             html: html,
             reasoning: reasoning || '',
+            rawMd: rawMd || '',
             time: Date.now()
         }));
     }
@@ -301,8 +313,10 @@
     function preprocessMarkdown(text) {
         if (!text) return "";
         // 1. 修复公式内美元符号与内容的空格（AI 有时会多写空格）
-        // 但注意不要破坏正常的文本内美元符号
-        text = text.replace(/\$\s+/g, '$').replace(/\s+\$/g, '$');
+        //    精确匹配 $...$ 对内 trim，避免破坏列表标记 "- $" 中的空格
+        text = text.replace(/\$([^$\n]+?)\$/g, (match, inner) => {
+            return '$' + inner.trim() + '$';
+        });
 
         // 2. 特殊处理：防止 Markdown 转义公式内的反斜杠
         // 这是一个比较稳健的做法：如果发现有 \begin{...}，确保它前后有换行
@@ -346,9 +360,9 @@
 
     insertContainer();
 
-    // ==========================================
-    // 5. 翻译按钮渲染
-    // ==========================================
+    // 存储原始 markdown 供复制功能使用
+    let currentRawMd = '';
+
     function renderTranslateButton() {
         container.innerHTML = `
             <div class="ai-translate-btn-row">
@@ -359,6 +373,7 @@
 
     function renderRetranslateButton() {
         return `<div class="ai-retranslate-bar">
+            <button class="ai-copy-btn" id="ai-copy-md" title="复制翻译内容的 Markdown 源码">📋 复制源码</button>
             <button class="ai-retranslate-btn" id="ai-trigger-retranslate">重新翻译</button>
         </div>`;
     }
@@ -368,31 +383,69 @@
         if (btn) btn.onclick = doTranslate;
     }
 
+    function bindCopyButton() {
+        const btn = document.getElementById('ai-copy-md');
+        if (!btn) return;
+        btn.onclick = async () => {
+            try {
+                await navigator.clipboard.writeText(currentRawMd);
+                btn.textContent = '✅ 已复制';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '📋 复制源码';
+                    btn.classList.remove('copied');
+                }, 2000);
+            } catch (e) {
+                // fallback for older browsers
+                const ta = document.createElement('textarea');
+                ta.value = currentRawMd;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                btn.textContent = '✅ 已复制';
+                btn.classList.add('copied');
+                setTimeout(() => {
+                    btn.textContent = '📋 复制源码';
+                    btn.classList.remove('copied');
+                }, 2000);
+            }
+        };
+    }
+
     // ==========================================
     // 6. 构建 Prompt
     // ==========================================
     function buildPrompt() {
         const taskPrompt = `# Role
-你是一位精通多国语言的算法竞赛（Competitive Programming）专家，擅长处理复杂的 PDF OCR 文本，并能精准修复受损的数学公式。
+你是一位精通多国语言的算法竞赛（Competitive Programming）专家，擅长处理复杂的题目文本，并能精准修复受损的数学公式。
 
 # Task
 你的任务是将一段从算法题目中提取的英文文本，翻译成专业、易懂的中文题目描述。
 
 # Rules & Process
+1. **内容筛选**：
+   - 仅提取"题目描述（Problem Description）"部分。
+   - 如果原文包含"样例解释（Note/Explanation）"，请一并翻译。
+   - **严格跳过**：输入输出格式、数据范围（Constraints）、样例数据、作者信息等。
 
-1. **数学公式**：
+2. **数学公式修复与重构（核心）**：
+   - 识别并修复因文本提取导致的公式错误（如 \`a i\` 修复为 $a_i$，\`n 2\` 修复为 $n^2$，\`10 9\` 修复为 $10^9$）。
    - **格式规范**：所有变量、常量、公式必须使用 LaTeX 语法，并用单美元符号 \`$\` 包裹。
-   - **严禁使用**：双美元符号 \`$$\`、\`\\( \)\`、\`\\[ \]\` 或普通括号表示公式。
+   - **严禁使用**：双美元符号 \`$$\`、\`\\( \\)\`、\`\\[ \\]\` 或普通括号表示公式。
    - **公式内严禁空格**：必须写 \`$a_i$\` 而不是 \`$ a_i $\`。符号与美元符之间不要有空格。
-   - **下标**：使用 \`_\` 表示下标，如 \`$a_i$\`、\`$dp_i$\`。确保 \`_\` 紧跟变量名，避免被 Markdown 解析为斜体标记。
+   - **示例**：分数必须为 \`$\\frac{a}{b}$\`，下标为 \`$a_i$\`，幂次为 \`$2^n$\`。
 
-2. **翻译原则**：
+3. **翻译原则**：
    - 保持准确性，严禁改写题目逻辑，严禁自行分析或给出解题思路。
    - 术语翻译需符合中文算法竞赛习惯（如：Tree 翻译为"树"，Query 翻译为"查询/询问"，Modulo 翻译为"取模"）。
 
-3. **输出格式**：
-   - 直接输出翻译后的 Markdown 内容，不输出任何前缀或后缀。
-   - 公式与中文之间不需要额外空格：如 \`选择 $x$\` 而不是 \`选择 \$x\$\`。
+4. **输出格式**：
+   - 直接输出翻译后的 Markdown 内容，不输出任何前缀（如"以下是翻译："）或后缀。
+   - 公式与中文之间不需要额外空格：如 \`选择 $x$\` 而不是 \`选择 $x $\`。
+   - 原文中的并列条件、枚举项应使用 Markdown 无序列表（\`- \`）或有序列表（\`1. \`）呈现。列表项之间用空行分隔。
 
 # Input Text
 ${extractedContent}`;
@@ -403,16 +456,21 @@ ${extractedContent}`;
 # Task
 将以下 AtCoder 官方英文题解翻译为中文。
 
-# Rules
+# Rules & Process
 1. **准确与通俗**：准确翻译算法思想（如 DP 状态转移、图论建模、贪心策略），语言要符合中国算法竞赛选手的阅读习惯。
-2. **公式规范**：
+
+2. **数学公式规范**：
    - 所有变量、常量、公式必须使用 LaTeX 语法，并用单美元符号 \`$\` 包裹。
    - **严禁使用**：双美元符号 \`$$\`、\`\\( \\)\`、\`\\[ \\]\`。
    - **公式内严禁空格**：必须写 \`$a_i$\` 而不是 \`$ a_i $\`。符号与美元符之间不要有空格。
    - **下标**：使用 \`_\` 表示下标，如 \`$dp_{i,j}$\`、\`$A_i$\`。
-   - 行首的公式（如 \`$-1 \\le x$\`）不要用 \`$$\` 包裹，直接用 \`$\`。避免与 Markdown 列表标记 \`-\` 冲突。
+   - 行首的公式（如 \`$-1 \\le x$\`）不要用 \`$$\` 包裹，直接用 \`$\`。若公式以 \`-\` 开头且恰好位于行首，请在 \`$\` 前加一个空格或换行，避免被误解析为列表标记。
+
 3. **代码处理**：如果原文包含代码片段，请保留原样，并可适当在代码旁添加中文注释。
-4. **直接输出**：直接输出翻译后的 Markdown 内容，不要包含任何多余的问候语或前缀。
+
+4. **输出格式**：
+   - 直接输出翻译后的 Markdown 内容，不要包含任何多余的问候语或前缀。
+   - 原文中的并列条件、枚举项应使用 Markdown 无序列表（\`- \`）或有序列表（\`1. \`）呈现。列表项之间用空行分隔。
 
 # Input Text
 ${extractedContent}`;
@@ -507,11 +565,13 @@ ${extractedContent}`;
                 }
             }
 
-            // 翻译完成后写入缓存并添加"重新翻译"按钮
+            // 翻译完成后写入缓存并添加按钮
             const finalHtml = container.innerHTML;
-            saveCache(finalHtml, reasoningContent);
+            currentRawMd = mdContent;
+            saveCache(finalHtml, reasoningContent, mdContent);
             container.innerHTML = renderRetranslateButton() + finalHtml;
             bindRetranslateButton();
+            bindCopyButton();
 
         } catch (err) {
             console.error(err);
@@ -526,6 +586,10 @@ ${extractedContent}`;
     if (cached && cached.html) {
         container.innerHTML = renderRetranslateButton() + cached.html;
         bindRetranslateButton();
+        bindCopyButton();
+        if (cached.rawMd) {
+            currentRawMd = cached.rawMd;
+        }
     } else {
         renderTranslateButton();
     }
