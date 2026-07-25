@@ -31,7 +31,7 @@
         provider: 'deepseek', // 'deepseek' 或 'openai'
         apiKey: '',
         baseUrl: 'https://api.deepseek.com',
-        model: 'deepseek-chat',
+        model: 'deepseek-v4-flash',
         enableReasoning: false // 是否开启 OpenRouter 的 extra_body reasoning
     };
 
@@ -108,7 +108,7 @@
         <input type="text" id="ai-baseurl" placeholder="https://api.deepseek.com">
 
         <label>模型名称 (Model)</label>
-        <input type="text" id="ai-model" placeholder="deepseek-chat">
+        <input type="text" id="ai-model" placeholder="deepseek-v4-flash">
 
         <label class="checkbox-label" title="适用于 OpenRouter 上的 Gemini 等支持 extra_body reasoning 的模型">
             <input type="checkbox" id="ai-reasoning"> 开启 OpenRouter Reasoning (extra_body)
@@ -152,7 +152,7 @@
     document.getElementById('ai-provider').addEventListener('change', function() {
         if (this.value === 'deepseek') {
             document.getElementById('ai-baseurl').value = 'https://api.deepseek.com';
-            document.getElementById('ai-model').value = 'deepseek-chat';
+            document.getElementById('ai-model').value = 'deepseek-v4-flash';
         } else {
             document.getElementById('ai-baseurl').value = 'https://openrouter.ai/api/v1';
             document.getElementById('ai-model').value = 'google/gemini-3.1-flash-lite-preview';
